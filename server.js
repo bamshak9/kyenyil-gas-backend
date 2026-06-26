@@ -5,9 +5,15 @@
    What this does:
    1. Accepts order submissions from purchase.js (POST /api/orders)
    2. Validates them on the server (never trust the browser alone)
-   3. Saves them into a SQLite file (data/orders.db) that persists
+   3. Saves them into a JSON file (data/orders.json) that persists
       between restarts as long as it's on a persistent disk
    4. Lets you view all orders at /admin (password protected)
+
+   Storage note: orders are stored as plain JSON rather than a
+   SQL database. This avoids any native module / Node-version
+   compilation issues on hosts like Render, at the cost of being
+   a little less efficient at very large scale — which is not a
+   concern for an order volume like this.
    ============================================= */
 
 require("dotenv").config();
@@ -15,7 +21,6 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
-const { DatabaseSync } = require("node:sqlite"); // built into Node.js — no compiling, no install step
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 
@@ -49,35 +54,41 @@ app.use(
 app.use(express.json({ limit: "100kb" }));
 
 // ---------------------------------------------
-// DATABASE SETUP
+// STORAGE SETUP — plain JSON file
 // ---------------------------------------------
 const DATA_DIR = path.join(__dirname, "data");
+const DB_PATH = path.join(DATA_DIR, "orders.json");
+
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
-const DB_PATH = path.join(DATA_DIR, "orders.db");
-const db = new DatabaseSync(DB_PATH);
+if (!fs.existsSync(DB_PATH)) {
+  fs.writeFileSync(DB_PATH, "[]", "utf8");
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS orders (
-    id              TEXT PRIMARY KEY,
-    cylinderSize    TEXT,
-    isCustomSize    INTEGER,
-    customSizeNote  TEXT,
-    quantity        INTEGER,
-    cylinderType    TEXT,
-    firstName       TEXT,
-    lastName        TEXT,
-    phone           TEXT,
-    address         TEXT,
-    area            TEXT,
-    deliveryDate    TEXT,
-    notes           TEXT,
-    paymentMethod   TEXT,
-    status          TEXT,
-    createdAt       TEXT
-  )
-`);
+// Simple in-process lock so two requests arriving at the exact
+// same moment can't both read-modify-write and clobber each other.
+let writeQueue = Promise.resolve();
+
+function readOrders() {
+  try {
+    const raw = fs.readFileSync(DB_PATH, "utf8");
+    return JSON.parse(raw || "[]");
+  } catch (err) {
+    console.error("Error reading orders file, starting fresh:", err);
+    return [];
+  }
+}
+
+function appendOrder(order) {
+  // Queue writes so they always happen one at a time, in order.
+  writeQueue = writeQueue.then(() => {
+    const orders = readOrders();
+    orders.push(order);
+    fs.writeFileSync(DB_PATH, JSON.stringify(orders, null, 2), "utf8");
+  });
+  return writeQueue;
+}
 
 // ---------------------------------------------
 // RATE LIMITING — prevents someone from spamming
@@ -101,7 +112,6 @@ const adminLimiter = rateLimit({
 // enforced server-side since client-side validation
 // can always be bypassed.
 // ---------------------------------------------
-const VALID_SIZES = ["1kg", "2kg", "5kg", "12.5kg", "25kg", "50kg", "custom"];
 const VALID_TYPES = ["refill", "new"];
 const VALID_PAYMENT = ["cash", "transfer"];
 
@@ -181,7 +191,7 @@ app.get("/", (req, res) => {
 });
 
 // Create a new order
-app.post("/api/orders", orderLimiter, (req, res) => {
+app.post("/api/orders", orderLimiter, async (req, res) => {
   try {
     const errors = validateOrder(req.body);
     if (errors.length > 0) {
@@ -190,22 +200,10 @@ app.post("/api/orders", orderLimiter, (req, res) => {
 
     const id = "KG-" + Date.now() + "-" + crypto.randomBytes(3).toString("hex").toUpperCase();
 
-    const stmt = db.prepare(`
-      INSERT INTO orders (
-        id, cylinderSize, isCustomSize, customSizeNote, quantity, cylinderType,
-        firstName, lastName, phone, address, area, deliveryDate, notes,
-        paymentMethod, status, createdAt
-      ) VALUES (
-        :id, :cylinderSize, :isCustomSize, :customSizeNote, :quantity, :cylinderType,
-        :firstName, :lastName, :phone, :address, :area, :deliveryDate, :notes,
-        :paymentMethod, :status, :createdAt
-      )
-    `);
-
-    stmt.run({
+    const order = {
       id,
       cylinderSize: String(req.body.cylinderSize || ""),
-      isCustomSize: req.body.isCustomSize ? 1 : 0,
+      isCustomSize: !!req.body.isCustomSize,
       customSizeNote: String(req.body.customSizeNote || ""),
       quantity: Number(req.body.quantity),
       cylinderType: String(req.body.cylinderType || ""),
@@ -219,7 +217,9 @@ app.post("/api/orders", orderLimiter, (req, res) => {
       paymentMethod: String(req.body.paymentMethod || ""),
       status: "pending",
       createdAt: new Date().toISOString(),
-    });
+    };
+
+    await appendOrder(order);
 
     res.status(201).json({ message: "Order received", orderId: id });
   } catch (err) {
@@ -250,9 +250,7 @@ function requireAdmin(req, res, next) {
 }
 
 app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
-  const orders = db
-    .prepare("SELECT * FROM orders ORDER BY createdAt DESC")
-    .all();
+  const orders = readOrders().slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 
   const rows = orders
     .map(
@@ -321,9 +319,7 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
 // Optional: raw JSON of all orders, useful if you ever want to
 // export or pipe into a spreadsheet.
 app.get("/admin/orders.json", adminLimiter, requireAdmin, (req, res) => {
-  const orders = db
-    .prepare("SELECT * FROM orders ORDER BY createdAt DESC")
-    .all();
+  const orders = readOrders().slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   res.json(orders);
 });
 

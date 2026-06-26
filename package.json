@@ -1,13 +1,13 @@
 {
   "name": "kyenyil-gas-backend",
   "version": "1.0.0",
-  "description": "Backend for Kyenyil Gas order form — receives orders and stores them in SQLite.",
+  "description": "Backend for Kyenyil Gas order form — receives orders and stores them as JSON.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=18.0.0"
   },
   "dependencies": {
     "cors": "^2.8.5",
