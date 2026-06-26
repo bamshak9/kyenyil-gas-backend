@@ -14,7 +14,8 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const Database = require("better-sqlite3");
+const fs = require("fs");
+const { DatabaseSync } = require("node:sqlite"); // built into Node.js — no compiling, no install step
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 
@@ -50,8 +51,12 @@ app.use(express.json({ limit: "100kb" }));
 // ---------------------------------------------
 // DATABASE SETUP
 // ---------------------------------------------
-const DB_PATH = path.join(__dirname, "data", "orders.db");
-const db = new Database(DB_PATH);
+const DATA_DIR = path.join(__dirname, "data");
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+const DB_PATH = path.join(DATA_DIR, "orders.db");
+const db = new DatabaseSync(DB_PATH);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS orders (
@@ -191,9 +196,9 @@ app.post("/api/orders", orderLimiter, (req, res) => {
         firstName, lastName, phone, address, area, deliveryDate, notes,
         paymentMethod, status, createdAt
       ) VALUES (
-        @id, @cylinderSize, @isCustomSize, @customSizeNote, @quantity, @cylinderType,
-        @firstName, @lastName, @phone, @address, @area, @deliveryDate, @notes,
-        @paymentMethod, @status, @createdAt
+        :id, :cylinderSize, :isCustomSize, :customSizeNote, :quantity, :cylinderType,
+        :firstName, :lastName, :phone, :address, :area, :deliveryDate, :notes,
+        :paymentMethod, :status, :createdAt
       )
     `);
 
