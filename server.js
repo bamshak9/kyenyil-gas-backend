@@ -82,12 +82,33 @@ function readOrders() {
 
 function appendOrder(order) {
   // Queue writes so they always happen one at a time, in order.
-  writeQueue = writeQueue.then(() => {
+  // We chain off writeQueue but always resolve it (via .catch(()=>{})
+  // for the shared chain) so one failed write never blocks every
+  // write that comes after it — the caller of THIS function still
+  // gets the real success/failure via the returned promise.
+  const result = writeQueue.then(() => {
     const orders = readOrders();
     orders.push(order);
     fs.writeFileSync(DB_PATH, JSON.stringify(orders, null, 2), "utf8");
   });
-  return writeQueue;
+  writeQueue = result.catch(() => {});
+  return result;
+}
+
+const VALID_STATUSES = ["pending", "confirmed", "cancelled"];
+
+function updateOrderStatus(orderId, newStatus) {
+  const result = writeQueue.then(() => {
+    const orders = readOrders();
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) {
+      throw new Error("Order not found");
+    }
+    order.status = newStatus;
+    fs.writeFileSync(DB_PATH, JSON.stringify(orders, null, 2), "utf8");
+  });
+  writeQueue = result.catch(() => {});
+  return result;
 }
 
 // ---------------------------------------------
@@ -255,7 +276,7 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
   const rows = orders
     .map(
       (o) => `
-    <tr>
+    <tr data-order-id="${escapeHtml(o.id)}">
       <td>${escapeHtml(o.id)}</td>
       <td>${escapeHtml(o.createdAt)}</td>
       <td>${escapeHtml(o.firstName)} ${escapeHtml(o.lastName)}</td>
@@ -267,7 +288,14 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
       <td>${escapeHtml(o.deliveryDate)}</td>
       <td>${escapeHtml(o.paymentMethod)}</td>
       <td>${escapeHtml(o.notes)}</td>
-      <td><span class="badge badge-${escapeHtml(o.status)}">${escapeHtml(o.status)}</span></td>
+      <td>
+        <span class="badge badge-${escapeHtml(o.status)} status-label">${escapeHtml(o.status)}</span>
+        <div class="status-actions">
+          <button class="status-btn confirm" data-status="confirmed" ${o.status === "confirmed" ? "disabled" : ""}>Mark Confirmed</button>
+          <button class="status-btn cancel" data-status="cancelled" ${o.status === "cancelled" ? "disabled" : ""}>Mark Cancelled</button>
+          <button class="status-btn reset" data-status="pending" ${o.status === "pending" ? "disabled" : ""}>Reset to Pending</button>
+        </div>
+      </td>
     </tr>`
     )
     .join("");
@@ -286,17 +314,26 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
   th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 0.85rem; vertical-align: top; }
   th { background: rgb(105,94,94); color: #fff; position: sticky; top: 0; }
   tr:hover { background: #faf8f8; }
-  .badge { padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+  .badge { padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; display: inline-block; margin-bottom: 6px; }
   .badge-pending { background: #fde7d2; color: #a05500; }
   .badge-confirmed { background: #d2f0e0; color: #0a7a4f; }
   .badge-cancelled { background: #f8d4d4; color: #a02020; }
   .count { font-weight: 600; }
   .wrap { overflow-x: auto; }
+  .status-actions { display: flex; flex-direction: column; gap: 4px; min-width: 140px; }
+  .status-btn { font-size: 0.72rem; padding: 4px 8px; border-radius: 5px; border: 1px solid #ddd; background: #fafafa; cursor: pointer; text-align: left; transition: background 0.15s ease; }
+  .status-btn:hover:not(:disabled) { background: #eee; }
+  .status-btn:disabled { opacity: 0.4; cursor: default; }
+  .status-btn.confirm { color: #0a7a4f; }
+  .status-btn.cancel { color: #a02020; }
+  .status-btn.reset { color: #555; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: #fff; padding: 10px 18px; border-radius: 6px; font-size: 0.85rem; opacity: 0; transition: opacity 0.3s ease; pointer-events: none; }
+  .toast.show { opacity: 1; }
 </style>
 </head>
 <body>
   <h1>🔥 Kyenyil Gas — Orders</h1>
-  <p class="sub"><span class="count">${orders.length}</span> total order(s). Refresh this page to see new orders.</p>
+  <p class="sub"><span class="count">${orders.length}</span> total order(s). Click a button below to update an order's status — no refresh needed.</p>
   <div class="wrap">
   <table>
     <thead>
@@ -311,6 +348,62 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
     </tbody>
   </table>
   </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    function showToast(msg, isError) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.style.background = isError ? '#a02020' : '#333';
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2500);
+    }
+
+    document.querySelectorAll('.status-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const row = btn.closest('tr');
+        const orderId = row.getAttribute('data-order-id');
+        const newStatus = btn.getAttribute('data-status');
+
+        btn.disabled = true;
+        btn.textContent = 'Updating...';
+
+        try {
+          const res = await fetch('/admin/orders/' + encodeURIComponent(orderId) + '/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: newStatus }),
+          });
+
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.message || 'Failed to update status');
+          }
+
+          // Update the badge text/class
+          const badge = row.querySelector('.status-label');
+          badge.textContent = newStatus;
+          badge.className = 'badge badge-' + newStatus + ' status-label';
+
+          // Re-enable all buttons in this row, then disable the one matching the new status
+          row.querySelectorAll('.status-btn').forEach(b => {
+            b.disabled = (b.getAttribute('data-status') === newStatus);
+          });
+
+          showToast('Order ' + orderId + ' marked as ' + newStatus + '.');
+        } catch (err) {
+          showToast(err.message, true);
+          btn.disabled = false;
+        } finally {
+          // restore original button labels
+          row.querySelectorAll('.status-btn').forEach(b => {
+            const s = b.getAttribute('data-status');
+            b.textContent = s === 'confirmed' ? 'Mark Confirmed' : s === 'cancelled' ? 'Mark Cancelled' : 'Reset to Pending';
+          });
+        }
+      });
+    });
+  </script>
 </body>
 </html>
   `);
@@ -321,6 +414,28 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
 app.get("/admin/orders.json", adminLimiter, requireAdmin, (req, res) => {
   const orders = readOrders().slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   res.json(orders);
+});
+
+// Update an order's status (pending / confirmed / cancelled).
+// Used by the buttons on the /admin page.
+app.post("/admin/orders/:id/status", adminLimiter, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  if (!VALID_STATUSES.includes(status)) {
+    return res.status(400).json({ message: "Invalid status value." });
+  }
+
+  try {
+    await updateOrderStatus(id, status);
+    res.json({ message: "Status updated", id, status });
+  } catch (err) {
+    if (err.message === "Order not found") {
+      return res.status(404).json({ message: "Order not found." });
+    }
+    console.error("Error updating order status:", err);
+    res.status(500).json({ message: "Server error. Please try again." });
+  }
 });
 
 app.listen(PORT, () => {
